@@ -10,7 +10,7 @@ override QUBES_CFLAGS := -I. -I../libqrexec -g -O2 -Wall -Wextra -Werror \
    -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIC -std=gnu11 -D_POSIX_C_SOURCE=200809L \
 	-D_GNU_SOURCE $(CFLAGS)
 override LDFLAGS += -pie -Wl,-z,relro,-z,now -L../libqrexec
-override LDLIBS=-lqrexec-utils $(shell pkg-config --libs vchan-$(BACKEND_VMM)) -lpam
+override LDLIBS=-lqrexec-utils $(shell pkg-config --libs vchan-$(BACKEND_VMM))
 
 .PHONY: all clean install
 
