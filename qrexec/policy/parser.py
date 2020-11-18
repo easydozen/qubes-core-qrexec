@@ -38,6 +38,8 @@ from typing import (
     List,
     TextIO,
     Tuple,
+    Dict,
+    Optional,
 )
 
 from .. import QREXEC_CLIENT, POLICYPATH, RPCNAME_ALLOWED_CHARSET, POLICYSUFFIX
@@ -197,7 +199,7 @@ class VMToken(str, metaclass=VMTokenMeta):
             token = '@adminvm'
 
         # if user specified just qube name, use it directly
-        if not token.startswith('@'):
+        if not (token.startswith('@') or token == '*'):
             return super().__new__(cls, token)
 
         # token starts with @, we search for right subclass
@@ -253,7 +255,7 @@ class VMToken(str, metaclass=VMTokenMeta):
     def is_special_value(self):
         '''Check if the token specification is special (keyword) value
         '''
-        return self.startswith('@')
+        return self.startswith('@') or self == '*'
 
     @property
     def type(self):
@@ -301,7 +303,8 @@ class IntendedTarget(VMToken):
 
         This function check if given value is not only syntactically correct,
         but also if names valid service call target (existing domain, or valid
-        ``'@dispvm'`` like keyword)
+        ``'@dispvm'`` like keyword). If the domain does not exist,
+        returns a DefaultVM.
 
         Args:
             system_info: information about the system
@@ -318,11 +321,30 @@ class IntendedTarget(VMToken):
             raise NotImplementedError()
 
         if self not in system_info['domains']:
-            raise AccessDenied('invalid target: {}'.format(str.__repr__(self)))
+            logging.warning(
+                'qrexec: target %r does not exist, using @default instead',
+                str(self))
+            return DefaultVM('@default',
+                filepath=self.filepath, lineno=self.lineno)
 
         return self
 
 # And the tokens. Inheritance defines, where the token can be used.
+
+class WildcardVM(Source, Target):
+    # any, including AdminVM
+
+    # pylint: disable=missing-docstring,unused-argument
+    EXACT = '*'
+    def match(self, other, *, system_info, source=None):
+        return True
+
+    def expand(self, *, system_info):
+        for name, domain in system_info['domains'].items():
+            yield IntendedTarget(name)
+            if domain['template_for_dispvms']:
+                yield DispVMTemplate('@dispvm:' + name)
+        yield DispVM('@dispvm')
 
 class AdminVM(Source, Target, Redirect, IntendedTarget):
     # no Source, for calls originating from AdminVM policy is not evaluated
@@ -498,7 +520,7 @@ class AllowResolution(AbstractResolution):
 
         target = self.target
 
-        if target == '@adminvm':
+        if target in ('dom0', '@adminvm'):
             cmd = ('QUBESRPC {request.service}{request.argument} '
                    '{request.source} {request.target.type} {request.target.text}').\
                 format(request=self.request)
@@ -741,6 +763,19 @@ class ActionType(metaclass=abc.ABCMeta):
         '''
         return IntendedTarget(self.target or intended_target)
 
+    @staticmethod
+    def allow_no_autostart(target, system_info):
+        '''
+        Should we allow this target when autostart is disabled
+        '''
+        if target == '@adminvm':
+            return True
+        if target.startswith('@dispvm'):
+            return False
+        assert target in system_info['domains']
+        return system_info['domains'][target]['power_state'] == 'Running'
+
+
 class Deny(ActionType):
     # pylint: disable=missing-docstring
     def __init__(self, *args, notify=None, **kwds):
@@ -767,12 +802,13 @@ class Deny(ActionType):
 
 class Allow(ActionType):
     # pylint: disable=missing-docstring
-    def __init__(self, *args, target=None, user=None, notify=None, **kwds):
+    def __init__(self, *args, target=None, user=None, notify=None, autostart=None, **kwds):
         super().__init__(*args, **kwds)
         self.target = Redirect(target,
             filepath=self.rule.filepath, lineno=self.rule.lineno)
         self.user = user
         self.notify = False if notify is None else notify
+        self.autostart = True if autostart is None else autostart
 
     def __repr__(self):
         return '<{} target={!r} user={!r}>'.format(
@@ -803,14 +839,23 @@ class Allow(ActionType):
                     'policy define \'allow\' action to @dispvm at {}:{} '
                     'but no DispVM base is set for this VM'.format(
                         self.rule.filepath, self.rule.lineno))
+        # expand default AdminVM
+        elif target == '@adminvm':
+            target = 'dom0'
+
+        if not self.autostart and not self.allow_no_autostart(
+                target, request.system_info):
+            raise AccessDenied(
+                'target {} is denied because it would require autostart')
 
         return request.allow_resolution_type(self.rule, request,
             user=self.user, target=target)
 
+
 class Ask(ActionType):
     # pylint: disable=missing-docstring
     def __init__(self, *args, target=None, default_target=None, user=None,
-                 notify=None, **kwds):
+                 notify=None, autostart=None, **kwds):
         super().__init__(*args, **kwds)
         self.target = Redirect(target,
             filepath=self.rule.filepath, lineno=self.rule.lineno)
@@ -818,6 +863,7 @@ class Ask(ActionType):
             filepath=self.rule.filepath, lineno=self.rule.lineno)
         self.user = user
         self.notify = False if notify is None else notify
+        self.autostart = True if autostart is None else autostart
 
     def __repr__(self):
         return '<{} target={!r} default_target={!r} user={!r}>'.format(
@@ -839,15 +885,35 @@ class Ask(ActionType):
             targets_for_ask = list(self.rule.policy.collect_targets_for_ask(
                 request))
 
+        if not self.autostart:
+            targets_for_ask = [
+                target for target in targets_for_ask
+                if self.allow_no_autostart(target, request.system_info)
+            ]
+
         if not targets_for_ask:
             raise AccessDenied(
                 'policy define \'ask\' action at {}:{} but no target is '
                 'available to choose from'.format(
                     self.rule.filepath, self.rule.lineno))
 
+        default_target = self.default_target
+        if default_target is not None:
+            # expand default DispVM
+            if isinstance(default_target, DispVM):
+                # pylint is confused by the metaclass - default_target is
+                # constructed as Redirect(), but in fact it can be any subclass
+                # pylint: disable=no-member
+                default_target = default_target.get_dispvm_template(
+                    request.source,
+                    system_info=request.system_info)
+            # expand default AdminVM
+            elif isinstance(default_target, AdminVM):
+                default_target = 'dom0'
+
         return request.ask_resolution_type(self.rule, request,
             user=self.user, targets_for_ask=targets_for_ask,
-            default_target=self.default_target)
+            default_target=default_target)
 
 @enum.unique
 class Action(enum.Enum):
@@ -889,37 +955,39 @@ class Rule:
 
         try:
             actiontype = Action[action].value
-        except KeyError:
+        except KeyError as err:
             raise PolicySyntaxError(filepath, lineno,
-                'invalid action: {}'.format(action))
+                'invalid action: {}'.format(action)) from err
 
         kwds = {}
         for param in params:
             try:
                 key, value = param.split('=', maxsplit=1)
-            except ValueError:
+            except ValueError as err:
                 raise PolicySyntaxError(filepath, lineno,
-                    'invalid action parameter syntax: {!r}'.format(param))
+                    'invalid action parameter syntax: {!r}'.format(param)) from err
             if key in kwds:
                 raise PolicySyntaxError(filepath, lineno,
                     'parameter given twice: {!r}'.format(key))
             kwds[key] = value
 
-        if 'notify' in kwds:
-            if kwds['notify'] not in ['yes', 'no']:
-                raise PolicySyntaxError(
-                    filepath, lineno,
-                    "'notify' is {!r}, but can be only 'yes' or 'no'".format(
-                        kwds['notify']))
-            kwds['notify'] = (kwds['notify'] == 'yes')
+        # boolean parameters
+        for key in ['notify', 'autostart']:
+            if key in kwds:
+                if kwds[key] not in ['yes', 'no']:
+                    raise PolicySyntaxError(
+                        filepath, lineno,
+                        "{!r} is {!r}, but can be only 'yes' or 'no'".format(
+                            key, kwds[key]))
+                kwds[key] = (kwds[key] == 'yes')
 
         try:
             #: policy action
             self.action = actiontype(rule=self, **kwds)
-        except TypeError:
+        except TypeError as err:
             raise PolicySyntaxError(filepath, lineno,
                 'invalid parameters for action {}: {}'.format(
-                    actiontype.__name__, params))
+                    actiontype.__name__, params)) from err
 
         # verify special cases
         if (isinstance(self.target, DefaultVM)
@@ -953,8 +1021,8 @@ class Rule:
 
         try:
             service, argument, source, target, action, *params = line.split()
-        except ValueError:
-            raise PolicySyntaxError(filepath, lineno, 'wrong number of fields')
+        except ValueError as err:
+            raise PolicySyntaxError(filepath, lineno, 'wrong number of fields') from err
 
         return cls(service, argument, source, target, action, params,
             policy=policy, filepath=filepath, lineno=lineno)
@@ -976,8 +1044,9 @@ class Rule:
         '''
         try:
             source, target, action, *params = line.split()
-        except ValueError:
-            raise PolicySyntaxError(filepath, lineno, 'wrong number of fields')
+        except ValueError as err:
+            raise PolicySyntaxError(
+                filepath, lineno, 'wrong number of fields') from err
 
         params = tuple(itertools.chain(*(p.split(',') for p in params)))
 
@@ -1058,18 +1127,18 @@ class AbstractParser(metaclass=abc.ABCMeta):
                 if directive == '!include':
                     try:
                         included_path, = params
-                    except ValueError:
+                    except ValueError as err:
                         raise PolicySyntaxError(filepath, lineno,
-                            'invalid number of params')
+                            'invalid number of params') from err
                     self.handle_include(pathlib.PurePosixPath(included_path),
                         filepath=filepath, lineno=lineno)
                     continue
                 if directive == '!include-dir':
                     try:
                         included_path, = params
-                    except ValueError:
+                    except ValueError as err:
                         raise PolicySyntaxError(filepath, lineno,
-                            'invalid number of params')
+                            'invalid number of params') from err
                     self.handle_include_dir(
                         pathlib.PurePosixPath(included_path),
                         filepath=filepath, lineno=lineno)
@@ -1077,9 +1146,9 @@ class AbstractParser(metaclass=abc.ABCMeta):
                 if directive == '!include-service':
                     try:
                         service, argument, included_path = params
-                    except ValueError:
+                    except ValueError as err:
                         raise PolicySyntaxError(filepath, lineno,
-                            'invalid number of params')
+                            'invalid number of params') from err
                     self.handle_include_service(service, argument,
                         pathlib.PurePosixPath(included_path),
                         filepath=filepath, lineno=lineno)
@@ -1128,9 +1197,9 @@ class AbstractParser(metaclass=abc.ABCMeta):
                 if directive == '!include':
                     try:
                         included_path, = params
-                    except ValueError:
+                    except ValueError as err:
                         raise PolicySyntaxError(filepath, lineno,
-                            'invalid number of params')
+                            'invalid number of params') from err
                     self.handle_include_service(service, argument,
                         pathlib.PurePosixPath(included_path),
                         filepath=filepath, lineno=lineno)
@@ -1372,7 +1441,7 @@ class AbstractFileSystemLoader(AbstractDirectoryLoader, AbstractFileLoader):
             self.load_policy_dir(self.policy_path)
         except OSError as err:
             raise AccessDenied(
-                'failed to load {} file: {!s}'.format(err.filename, err))
+                'failed to load {} file: {!s}'.format(err.filename, err)) from err
 
     def resolve_path(self, included_path):
         return (self.policy_path / included_path).resolve()
@@ -1398,57 +1467,45 @@ class FilePolicy(AbstractFileSystemLoader, AbstractPolicy):
         subparser = Compat40Loader(master=self)
         subparser.execute(filepath=filepath, lineno=lineno)
 
-class ValidateIncludesParser(AbstractParser):
-    '''A parser that checks if included file does indeed exist.
 
-    The included file is not read, because if it exists, it is assumed it
-    already passed syntax check.
+class ValidateParser(FilePolicy):
     '''
-    def handle_include(self, included_path: pathlib.PurePosixPath, *,
-            filepath, lineno):
-        # TODO disallow anything other that @include:[include/]<file>
-        included_path = (filepath.resolve().parent / included_path).resolve()
-        if not included_path.is_file():
-            raise PolicySyntaxError(filepath, lineno,
-                'included path {!s} does not exist'.format(included_path))
+    A parser that validates the policy directory along with proposed changes.
 
-    def handle_include_service(self, service, argument,
-            included_path: pathlib.PurePosixPath, *, filepath, lineno):
-        # TODO disallow anything other that @include:[include/]<file>
-        included_path = (filepath.resolve().parent / included_path).resolve()
-        if not included_path.is_file():
-            raise PolicySyntaxError(filepath, lineno,
-                'included path {!s} does not exist'.format(included_path))
-
-    def handle_include_dir(self, included_path: pathlib.PurePosixPath, *,
-            filepath, lineno):
-        included_path = (filepath.resolve().parent / included_path).resolve()
-        if not included_path.is_dir():
-            raise PolicySyntaxError(filepath, lineno,
-                'included path {!s} does not exist'.format(included_path))
-
-    def handle_rule(self, rule, *, filepath, lineno):
-        pass
-
-class CheckIfNotIncludedParser(FilePolicy):
-    '''A parser that checks if a particular file is *not* included.
-
-    This is used while removing a particular file, to check that it is not used
-    anywhere else.
+    Pass files to be overriden in the ``overrides`` dictionary, with either
+    new content, or None if the file is to be deleted.
     '''
-    def __init__(self, *args, to_be_removed, **kwds):
-        self.to_be_removed = self.policy_path / to_be_removed
+
+    def __init__(self, *args,
+                 overrides: Dict[pathlib.Path, Optional[str]],
+                 **kwds):
+        self.overrides = overrides
         super().__init__(*args, **kwds)
 
-    def resolve_path(self, included_path):
-        included_path = super().resolve_path(included_path)
-        if included_path.samefile(self.to_be_removed):
-            raise ValueError(
-                'included path {!s}'.format(included_path))
-        return included_path
+    def load_policy_dir(self, dirpath):
+        for path in filter_filepaths(dirpath.iterdir()):
+            if path not in self.overrides:
+                with path.open() as file:
+                    self.load_policy_file(file, path)
+        for path, content in self.overrides.items():
+            if path.parent == dirpath and content is not None:
+                self.load_policy_file(io.StringIO(content), path)
+
+    def resolve_filepath(self, included_path: pathlib.PurePosixPath, *,
+            filepath, lineno) -> Tuple[TextIO, pathlib.PurePath]:
+        path = self.resolve_path(included_path)
+        if path in self.overrides:
+            if self.overrides[path] is None:
+                raise exc.PolicySyntaxError(
+                    filepath, lineno,
+                    'including a file that will be removed: {}'.format(path))
+            return io.StringIO(self.overrides[path]), path
+        return super().resolve_filepath(included_path,
+                                        filepath=filepath, lineno=lineno)
 
     def handle_rule(self, rule, *, filepath, lineno):
         pass
+
 
 class ToposortMixIn:
     '''A helper for topological sorting the policy files'''
@@ -1580,9 +1637,9 @@ class TestLoader(AbstractFileLoader):
         included_path = str(included_path)
         try:
             file = io.StringIO(self.policy[included_path])
-        except KeyError:
+        except KeyError as err:
             raise exc.PolicySyntaxError(filepath, lineno,
-                'no such policy file: {!r}'.format(included_path))
+                'no such policy file: {!r}'.format(included_path)) from err
         return file, pathlib.PurePosixPath(included_path + '[in-memory]')
 
     def handle_include_dir(self, included_path: pathlib.PurePosixPath, *,

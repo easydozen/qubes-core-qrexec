@@ -15,7 +15,8 @@ Each line consist of three values separated by white characters (space(s), tab(s
 1. Source specification, which is one of:
 
   - domain name
-  - `$anyvm` - any domain
+  - `$anyvm` - any domain, excluding dom0
+  - `*` - any domain
   - `$tag:some-tag` - VM having tag `some-tag`
   - `$type:vm-type` - VM of `vm-type` type, available types:
     AppVM, TemplateVM, StandaloneVM, DispVM
@@ -24,6 +25,7 @@ Each line consist of three values separated by white characters (space(s), tab(s
 
   - domain name
   - `$anyvm` - any domain, excluding dom0
+  - `*` - any domain
   - `$tag:some-tag` - domain having tag `some-tag`
   - `$type:vm-type` - domain of `vm-type` type, available types:
     AppVM, TemplateVM, StandaloneVM, DispVM
@@ -45,6 +47,7 @@ Each line consist of three values separated by white characters (space(s), tab(s
       possible values are: domain name, `$dispvm` or `$dispvm:vm-name`
     - `user=` - call the service using this user, instead of the user
       pointed by target VM's `default_user` property
+    - `autostart=no` - deny if the target is not currently running
   - `deny` - deny the call, without further questions; no optional
     parameters are supported
   - `ask` - ask the user for confirmation; optional parameters:
@@ -54,6 +57,8 @@ Each line consist of three values separated by white characters (space(s), tab(s
       pointed by target VM's `default_user` property
     - `default_target=` - suggest this target when prompting the user for
       confirmation
+    - `autostart=no` - allow (and display) only targets that are currently
+      running
 
 Alternatively, a line may consist of a single keyword `$include:` followed by a
 path. This will load a given file as its content would be in place of
